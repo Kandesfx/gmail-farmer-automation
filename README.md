@@ -526,9 +526,9 @@ Các quy tắc cốt lõi:
 
 ## 👤 Tác Giả
 
-**Lê Vũ Hải**
-
 Tool tự động hóa tạo Gmail với kiến trúc GPM Profiles + Python Orchestration + Selenium.
+
+Dự án nội bộ - Không phân phối công khai.
 
 ---
 

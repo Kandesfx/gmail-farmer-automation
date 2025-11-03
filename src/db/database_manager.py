@@ -8,7 +8,10 @@ from pymongo import MongoClient
 from pymongo.collection import Collection
 from bson import ObjectId
 
-from ..utils.logger import get_logger
+try:
+    from ..utils.logger import get_logger
+except ImportError:
+    from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
@@ -180,28 +183,106 @@ class DatabaseManager:
     
     def get_pending(self) -> Optional[Dict[str, Any]]:
         """
-        Lấy 1 account có status="pending" (FIFO)
+        Lấy 1 account có thể xử lý (status != "created" và không đang được xử lý)
+        Lấy cả pending, failed, error, v.v. để retry lại
         
         Returns:
             Dict chứa thông tin account, hoặc None nếu không có
         """
         try:
+            # Các status cần loại trừ (created + các status đang xử lý)
+            excluded_statuses = [
+                "created",  # Đã hoàn thành - không lấy
+                "creating",  # Đang được xử lý
+                "waiting-recovery",  # Đang đợi recovery
+                "recovery-received",  # Đã nhận recovery
+                "waiting-complete",  # Đang đợi complete
+                "waiting-observe"  # Đang đợi operator can thiệp
+            ]
+            
+            # Query: status không nằm trong danh sách loại trừ
+            # → Lấy: pending, failed, failed-phone, failed-captcha, error
+            query = {
+                "status": {"$nin": excluded_statuses}
+            }
+            
             account = self.accounts.find_one(
-                {"status": "pending"},
-                sort=[("created_at", pymongo.ASCENDING)]  # FIFO
+                query,
+                sort=[("created_at", pymongo.ASCENDING)]  # FIFO - lấy account cũ nhất
             )
             
             if account:
                 account["_id"] = str(account["_id"])  # Convert ObjectId to string cho dễ xử lý
-                logger.info(f"✅ Tìm thấy pending account: {account.get('email')}")
+                logger.info(f"✅ Tìm thấy account để xử lý: {account.get('email')} (status={account.get('status')})")
                 return account
             else:
-                logger.debug("ℹ️ Không có account pending nào")
+                logger.debug("ℹ️ Không có account nào để xử lý (tất cả đã created hoặc đang xử lý)")
                 return None
                 
         except Exception as e:
             logger.error(f"❌ Lỗi get_pending: {e}")
             return None
+    
+    def count_pending_accounts(self) -> int:
+        """
+        Đếm số lượng accounts có thể xử lý (status != "created" và không đang được xử lý)
+        Tương tự logic trong get_pending()
+        
+        Returns:
+            Số lượng accounts có thể xử lý
+        """
+        try:
+            # Các status cần loại trừ (created + các status đang xử lý)
+            excluded_statuses = [
+                "created",  # Đã hoàn thành - không đếm
+                "creating",  # Đang được xử lý
+                "waiting-recovery",  # Đang đợi recovery
+                "recovery-received",  # Đã nhận recovery
+                "waiting-complete",  # Đang đợi complete
+                "waiting-observe"  # Đang đợi operator can thiệp
+            ]
+            
+            # Query: status không nằm trong danh sách loại trừ
+            # → Đếm: pending, failed, failed-phone, failed-captcha, error
+            query = {
+                "status": {"$nin": excluded_statuses}
+            }
+            
+            count = self.accounts.count_documents(query)
+            return count
+        except Exception as e:
+            logger.error(f"❌ Lỗi count_pending_accounts: {e}")
+            return 0
+    
+    def count_creating_accounts(self) -> int:
+        """
+        Đếm số lượng accounts đang được xử lý (status="creating")
+        
+        Returns:
+            Số lượng accounts đang creating
+        """
+        try:
+            count = self.accounts.count_documents({"status": "creating"})
+            return count
+        except Exception as e:
+            logger.error(f"❌ Lỗi count_creating_accounts: {e}")
+            return 0
+    
+    def count_available_accounts(self) -> int:
+        """
+        Đếm số lượng accounts sẵn sàng để xử lý (pending + creating)
+        Dùng để kiểm tra xem có cần gửi Register messages không
+        
+        Returns:
+            Tổng số accounts pending + creating
+        """
+        try:
+            pending = self.count_pending_accounts()
+            creating = self.count_creating_accounts()
+            return pending + creating
+        except Exception as e:
+            logger.error(f"❌ Lỗi count_available_accounts: {e}")
+            return 0
     
     def get_idle_profile(self) -> Optional[Dict[str, Any]]:
         """
@@ -298,6 +379,90 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"❌ Lỗi update_profile_status {profile_id}: {e}")
             return False
+    
+    def sync_profiles_from_gpm(self, gpm_profiles: list) -> int:
+        """
+        Đồng bộ profiles từ GPM API vào MongoDB
+        Insert profiles mới và update profiles đã tồn tại (không override status nếu đang in_use)
+        
+        Args:
+            gpm_profiles: List các profiles từ GPM API (từ get_profile_list)
+            
+        Returns:
+            Số lượng profiles đã được sync
+        """
+        if not gpm_profiles:
+            logger.warning("⚠️ Không có profiles từ GPM để sync")
+            return 0
+        
+        synced_count = 0
+        try:
+            for gpm_profile in gpm_profiles:
+                try:
+                    # GPM API trả về "id" nhưng MongoDB dùng "profile_id"
+                    profile_id = gpm_profile.get("id") or gpm_profile.get("profile_id")
+                    if not profile_id:
+                        logger.warning(f"⚠️ Profile không có ID, bỏ qua: {gpm_profile}")
+                        continue
+                    
+                    # Kiểm tra profile đã tồn tại chưa
+                    existing = self.profiles.find_one({"profile_id": profile_id})
+                    
+                    if existing:
+                        # Profile đã tồn tại - chỉ update metadata, không đổi status nếu đang in_use
+                        update_data = {
+                            "name": gpm_profile.get("name", existing.get("name")),
+                            "browser_type": gpm_profile.get("browser_type"),
+                            "browser_version": gpm_profile.get("browser_version"),
+                            "group_id": gpm_profile.get("group_id"),
+                            "profile_path": gpm_profile.get("profile_path"),
+                            "note": gpm_profile.get("note"),
+                            "updated_at": datetime.utcnow()
+                        }
+                        
+                        # Chỉ update status nếu profile không đang được sử dụng (idle hoặc stopped)
+                        current_status = existing.get("status")
+                        if current_status not in ["in_use", "creating", "waiting-recovery"]:
+                            # Nếu profile đang idle hoặc stopped, có thể reset về idle
+                            update_data["status"] = "idle"
+                            update_data["account_id"] = None  # Xóa account_id nếu reset về idle
+                        
+                        self.profiles.update_one(
+                            {"profile_id": profile_id},
+                            {"$set": update_data}
+                        )
+                        synced_count += 1
+                    else:
+                        # Profile mới - insert vào MongoDB với status="idle"
+                        profile_doc = {
+                            "profile_id": profile_id,
+                            "name": gpm_profile.get("name", f"Profile {profile_id[:8]}"),
+                            "status": "idle",  # Mặc định idle
+                            "browser_type": gpm_profile.get("browser_type", "chromium"),
+                            "browser_version": gpm_profile.get("browser_version"),
+                            "group_id": gpm_profile.get("group_id"),
+                            "profile_path": gpm_profile.get("profile_path"),
+                            "note": gpm_profile.get("note", ""),
+                            "account_id": None,
+                            "debug_port": None,
+                            "created_at": datetime.utcnow(),
+                            "updated_at": datetime.utcnow()
+                        }
+                        
+                        self.profiles.insert_one(profile_doc)
+                        synced_count += 1
+                        logger.info(f"✅ Đã thêm profile mới: {profile_id} ({profile_doc.get('name')})")
+                        
+                except Exception as e:
+                    logger.error(f"❌ Lỗi sync profile {gpm_profile.get('id')}: {e}")
+                    continue
+            
+            logger.info(f"✅ Đã sync {synced_count}/{len(gpm_profiles)} profiles từ GPM vào MongoDB")
+            return synced_count
+            
+        except Exception as e:
+            logger.error(f"❌ Lỗi sync profiles từ GPM: {e}", exc_info=True)
+            return synced_count
     
     def close(self):
         """Đóng kết nối MongoDB"""

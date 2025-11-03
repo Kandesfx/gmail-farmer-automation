@@ -6,7 +6,10 @@ import time
 import random
 import requests
 from typing import Optional, Dict, Any
-from ..utils.logger import get_logger
+try:
+    from ..utils.logger import get_logger
+except ImportError:
+    from utils.logger import get_logger
 
 logger = get_logger(__name__)
 

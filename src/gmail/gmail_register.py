@@ -18,12 +18,20 @@ from bson import ObjectId
 from telethon import TelegramClient
 from telethon.tl.functions.messages import GetBotCallbackAnswerRequest
 
-from ..db.database_manager import DatabaseManager
-from ..core.gpm_manager import GPMManager
-from ..core.proxy_manager import ProxyManager
-from ..core.otp_manager import OTPManager
-from ..utils.humanizer import Humanizer
-from ..utils.logger import get_logger
+try:
+    from ..db.database_manager import DatabaseManager
+    from ..core.gpm_manager import GPMManager
+    from ..core.proxy_manager import ProxyManager
+    from ..core.otp_manager import OTPManager
+    from ..utils.humanizer import Humanizer
+    from ..utils.logger import get_logger
+except ImportError:
+    from db.database_manager import DatabaseManager
+    from core.gpm_manager import GPMManager
+    from core.proxy_manager import ProxyManager
+    from core.otp_manager import OTPManager
+    from utils.humanizer import Humanizer
+    from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
@@ -62,32 +70,114 @@ def create_gmail_account(
     try:
         logger.info(f"🚀 Bắt đầu tạo Gmail cho account: {account.get('email')}")
         
-        # 1. Lấy proxy VN
-        proxy = proxy_manager.get_vn_proxy()
-        if not proxy:
-            logger.error("❌ Không thể lấy proxy VN")
-            db_manager.update_status(account_id, "failed", last_error="Không thể lấy proxy VN")
+        # ============================================================
+        # VALIDATION BẮT BUỘC - FAIL-FAST (theo rules.md)
+        # ============================================================
+        validation_errors = []
+        
+        # 1. Validate account fields (bắt buộc)
+        if not account.get("email"):
+            validation_errors.append("Thiếu email (bắt buộc)")
+        if not account.get("first_name"):
+            validation_errors.append("Thiếu first_name (bắt buộc)")
+        if not account.get("password"):
+            validation_errors.append("Thiếu password (bắt buộc)")
+        
+        # 2. Validate profile (bắt buộc)
+        if not profile_id:
+            validation_errors.append("Thiếu profile_id (bắt buộc)")
+        
+        # 3. Validate Telegram metadata (cần cho callback Complete)
+        if not account.get("message_chat_id") and not account.get("source_chat_id"):
+            validation_errors.append("Thiếu message_chat_id/source_chat_id (cần cho callback)")
+        if not account.get("message_id_input"):
+            validation_errors.append("Thiếu message_id_input (cần cho callback)")
+        
+        # Nếu có lỗi validation → FAIL-FAST
+        if validation_errors:
+            error_msg = "; ".join(validation_errors)
+            logger.error(f"❌ VALIDATION FAILED - Dừng ngay: {error_msg}")
+            db_manager.update_status(account_id, "failed", last_error=f"Validation failed: {error_msg}")
+            # Không cần stop profile vì chưa start
             return False
         
-        # 2. Start profile với proxy
+        logger.info("✅ Validation passed - Các trường bắt buộc đã đầy đủ")
+        
+        # ============================================================
+        # 1. Gán proxy cho profile (BẮT BUỘC theo rules.md)
+        # ============================================================
+        logger.info(f"🔗 Đang gán proxy cho profile {profile_id}...")
+        try:
+            # Gán proxy và validate (FAIL-FAST nếu lỗi)
+            proxy = proxy_manager.assign_proxy_for_profile(
+                profile_id=profile_id,
+                change_ip=False  # Không xoay IP mỗi lần tạo account (có thể bật nếu cần)
+            )
+            logger.info(f"✅ Đã gán proxy thành công: {proxy['host']}:{proxy.get('port', 'N/A')}")
+        except RuntimeError as proxy_error:
+            error_msg = f"Không thể gán proxy cho profile {profile_id}: {str(proxy_error)}"
+            logger.error(f"❌ {error_msg} - FAIL-FAST")
+            _take_screenshot(driver, screenshots_dir, account_id, db_manager, "proxy_failed")
+            db_manager.update_status(account_id, "failed", last_error=error_msg)
+            # Cập nhật profile status → "error" (theo yêu cầu)
+            db_manager.update_profile_status(profile_id, "error", account_id=account_id)
+            return False
+        except Exception as proxy_error:
+            error_msg = f"Lỗi không xác định khi gán proxy: {str(proxy_error)}"
+            logger.error(f"❌ {error_msg} - FAIL-FAST")
+            _take_screenshot(driver, screenshots_dir, account_id, db_manager, "proxy_failed")
+            db_manager.update_status(account_id, "failed", last_error=error_msg)
+            db_manager.update_profile_status(profile_id, "error", account_id=account_id)
+            return False
+        
+        # ============================================================
+        # 2. Start profile với proxy (BẮT BUỘC - theo rules.md)
+        # ============================================================
+        logger.info(f"🚀 Đang start profile {profile_id} với proxy...")
         profile_result = gpm_manager.start_profile(profile_id, proxy=proxy)
-        if not profile_result or not profile_result.get("debugPort"):
-            logger.error(f"❌ Không thể start profile {profile_id} hoặc không có debugPort")
-            db_manager.update_status(account_id, "failed-start", last_error="GPM không trả về debugPort")
+        
+        # Ưu tiên dùng remote_debugging_port (API v3), fallback về debugPort (backward compatibility)
+        debug_port = profile_result.get("remote_debugging_port") if profile_result else None
+        if not debug_port:
+            debug_port = profile_result.get("debugPort") if profile_result else None
+        
+        # FAIL-FAST: Nếu không có debugPort → failed-start (theo rules.md)
+        if not profile_result or not debug_port:
+            error_msg = f"GPM không trả về remote_debugging_port cho profile {profile_id}"
+            logger.error(f"❌ {error_msg} - FAIL-FAST")
+            _take_screenshot(driver, screenshots_dir, account_id, db_manager, "start_profile_failed")
+            db_manager.update_status(account_id, "failed-start", last_error=error_msg)
+            # Profile chưa start thành công, không cần stop
+            db_manager.update_profile_status(profile_id, "idle")  # Rollback profile status
             return False
         
-        debug_port = profile_result["debugPort"]
-        logger.info(f"✅ Profile đã start, debugPort: {debug_port}")
+        logger.info(f"✅ Profile đã start, remote_debugging_port: {debug_port}")
         
-        # 3. Setup Selenium với remote debugging
+        # ============================================================
+        # 3. Setup Selenium với remote debugging (BẮT BUỘC)
+        # ============================================================
+        logger.info(f"🔧 Đang setup Selenium với debug_port: {debug_port}...")
         driver = _setup_selenium(debug_port)
         if not driver:
-            logger.error("❌ Không thể setup Selenium")
-            db_manager.update_status(account_id, "failed-start", last_error="Không thể khởi tạo Selenium")
+            error_msg = "Không thể khởi tạo Selenium driver với remote debugging port"
+            logger.error(f"❌ {error_msg} - FAIL-FAST")
+            _take_screenshot(driver, screenshots_dir, account_id, db_manager, "selenium_init_failed")
+            db_manager.update_status(account_id, "failed-start", last_error=error_msg)
+            # Đã start profile nhưng không attach được → cần stop profile
+            try:
+                gpm_manager.stop_profile(profile_id)
+                db_manager.update_profile_status(profile_id, "idle")
+            except Exception as stop_error:
+                logger.error(f"❌ Lỗi stop profile sau khi Selenium init failed: {stop_error}")
             return False
         
+        logger.info("✅ Đã khởi tạo Selenium driver thành công")
+        
+        # ============================================================
         # 4. Điền form Gmail Signup
+        # ============================================================
         if not _fill_gmail_signup_form(driver, account, screenshots_dir, account_id, db_manager):
+            # _fill_gmail_signup_form đã set status và screenshot → return False
             return False
         
         # 5. Xử lý OTP nếu có
@@ -114,31 +204,50 @@ def create_gmail_account(
         return success
         
     except Exception as e:
-        logger.error(f"❌ Lỗi không mong đợi trong create_gmail_account: {e}", exc_info=True)
+        # FAIL-FAST: Bất kỳ exception nào → error status (theo rules.md)
+        error_msg = f"Exception không mong đợi: {str(e)}"
+        logger.error(f"❌ {error_msg} - FAIL-FAST", exc_info=True)
         _take_screenshot(driver, screenshots_dir, account_id, db_manager, "error")
-        db_manager.update_status(account_id, "error", last_error=str(e))
+        db_manager.update_status(account_id, "error", last_error=error_msg)
         return False
         
     finally:
-        # Cleanup
+        # ============================================================
+        # CLEANUP - Luôn thực hiện (theo rules.md)
+        # ============================================================
+        logger.info("🧹 Đang cleanup resources...")
+        
+        # 1. Quit Selenium driver
         if driver:
             try:
                 driver.quit()
-            except:
-                pass
+                logger.debug("✅ Đã quit Selenium driver")
+            except Exception as e:
+                logger.warning(f"⚠️ Lỗi quit driver: {e}")
         
+        # 2. Cancel phone order nếu có
         if phone_order:
             try:
-                otp_manager.cancel_order(phone_order.get("order_id"))
-            except:
-                pass
+                order_id = phone_order.get("order_id")
+                if order_id:
+                    otp_manager.cancel_order(order_id)
+                    logger.debug(f"✅ Đã cancel phone order: {order_id}")
+            except Exception as e:
+                logger.warning(f"⚠️ Lỗi cancel phone order: {e}")
         
-        # Stop profile
-        try:
-            gpm_manager.stop_profile(profile_id)
-            db_manager.update_profile_status(profile_id, "idle")
-        except Exception as e:
-            logger.error(f"❌ Lỗi stop profile: {e}")
+        # 3. Stop profile (BẮT BUỘC theo rules.md - luôn stop trong finally)
+        if profile_id:
+            try:
+                gpm_manager.stop_profile(profile_id)
+                db_manager.update_profile_status(profile_id, "idle")
+                logger.info(f"✅ Đã stop profile: {profile_id}")
+            except Exception as e:
+                logger.error(f"❌ Lỗi stop profile {profile_id}: {e}", exc_info=True)
+                # Vẫn cố update status về idle để không block profile
+                try:
+                    db_manager.update_profile_status(profile_id, "idle")
+                except:
+                    pass
 
 
 def _setup_selenium(debug_port: int) -> Optional[webdriver.Chrome]:

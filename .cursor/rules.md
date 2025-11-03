@@ -23,17 +23,48 @@ I. QUY TẮC NGÔN NGỮ & GIAO TIẾP
 ========================================================
 II. LUỒNG NGHIỆP VỤ CHÍNH
 ========================================================
-1. Khi operator bấm "➕ Register a new Gmail" trong @GmailFarmerBot:
-   - Bot gửi block chứa: First name / Last name / Email / Password
-   - **Hệ thống parse** và lưu document vào MongoDB với `status="pending"` cùng các meta (xem dưới).
+0. KHỞI ĐỘNG HỆ THỐNG & ĐẢM BẢO SỐ LƯỢNG ACCOUNTS:
+   - Khi hệ thống khởi động, **tự động kiểm tra** số lượng accounts có `status="pending"` trong DB.
+   - **Mỗi phiên làm việc yêu cầu 3 accounts** với `status="pending"` để tối ưu hóa việc sử dụng profiles.
+   - Logic kiểm tra:
+     • Đếm số accounts có `status="pending"` trong DB.
+     • Nếu **< 3 accounts pending** → Hệ thống tự động gửi tin nhắn "➕ Register a new Gmail" cho @GmailFarmerBot.
+     • Nếu **≥ 3 accounts pending** → Không cần gửi thêm, tiếp tục xử lý các accounts hiện có.
+     • Gửi tiếp cho đến khi đạt **đủ 3 accounts pending** (hoặc bot không trả về thêm).
+   - Việc gửi tin nhắn cho bot được thực hiện **tự động bởi hệ thống**, không cần operator can thiệp.
+
+1. Khi hệ thống gửi "➕ Register a new Gmail" cho @GmailFarmerBot:
+   - Bot trả về message với format:
+     • **First name**: (ví dụ: "Georgeanna")
+     • **Last name**: (có thể là "X" hoặc tên khác)
+     • **Email**: (ví dụ: "ojegoxuzat420@gmail.com")
+     • **Password**: (ví dụ: "X7SSQu1bWbtMUV")
+     • Message cũng chứa các nút: "✓ Done", "🚫 Cancel registration", "❓ How to create account"
+     • Timestamp và metadata của message
+   - **Hệ thống parse** message và trích xuất các trường:
+     • `first_name`: string
+     • `last_name`: string (có thể rỗng hoặc "X")
+     • `email`: string (chuẩn hoá lower-case)
+     • `password`: string
+   - Lưu document vào MongoDB với `status="pending"` cùng các meta (xem dưới).
+   - **Lưu ý**: Message từ bot có format cố định, parse theo pattern để trích xuất chính xác các trường.
 
 --- BEGIN: MESSAGE ID & BUTTON MAPPING (BẮT BUỘC) ---
 
-Ngay khi parse message “Register a new Gmail” từ GmailFarmerBot, **bắt buộc** lưu các trường meta sau trong document MongoDB:
+Ngay khi parse message "Register a new Gmail" từ GmailFarmerBot, **bắt buộc** lưu các trường sau trong document MongoDB:
+
+**Trường dữ liệu account:**
+- first_name: string (ví dụ: "Georgeanna")
+- last_name: string (có thể rỗng hoặc "X")
+- email: string (chuẩn hoá lower-case) → **KHÓA CHÍNH**
+- password: string
+
+**Trường metadata Telegram:**
 - message_id_input: integer (message_id của Telegram message chứa dữ liệu)
 - message_chat_id / source_chat_id: id chat nơi message được gửi (dùng để callback)
 - message_ts: timestamp của message
-- email: string (chuẩn hoá lower-case) → **KHÓA CHÍNH**
+
+**Trường hỗ trợ:**
 - operator_notified_at (nullable)
 - last_error (nullable)
 - screenshot_path (nullable)
