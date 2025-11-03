@@ -1,0 +1,729 @@
+"""
+Gmail Register - Worker tạo tài khoản Gmail
+Selenium + GPM remote debugging + OTP + Recovery handling
+"""
+import os
+import time
+import asyncio
+from pathlib import Path
+from typing import Optional, Dict, Any
+from datetime import datetime
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException, WebDriverException
+from bson import ObjectId
+from telethon import TelegramClient
+from telethon.tl.functions.messages import GetBotCallbackAnswerRequest
+
+from ..db.database_manager import DatabaseManager
+from ..core.gpm_manager import GPMManager
+from ..core.proxy_manager import ProxyManager
+from ..core.otp_manager import OTPManager
+from ..utils.humanizer import Humanizer
+from ..utils.logger import get_logger
+
+logger = get_logger(__name__)
+
+
+def create_gmail_account(
+    account: Dict[str, Any],
+    profile: Dict[str, Any],
+    db_manager: DatabaseManager,
+    gpm_manager: GPMManager,
+    proxy_manager: ProxyManager,
+    otp_manager: OTPManager,
+    telegram_client: TelegramClient,
+    screenshots_dir: Path
+) -> bool:
+    """
+    Worker function tạo tài khoản Gmail
+    
+    Args:
+        account: Dict chứa thông tin account (từ DB)
+        profile: Dict chứa thông tin profile
+        db_manager: DatabaseManager instance
+        gpm_manager: GPMManager instance
+        proxy_manager: ProxyManager instance
+        otp_manager: OTPManager instance
+        telegram_client: TelegramClient instance (cho callback)
+        screenshots_dir: Thư mục lưu screenshots
+        
+    Returns:
+        True nếu thành công, False nếu thất bại
+    """
+    account_id = ObjectId(account["_id"])
+    profile_id = profile.get("profile_id")
+    driver = None
+    phone_order = None
+    
+    try:
+        logger.info(f"🚀 Bắt đầu tạo Gmail cho account: {account.get('email')}")
+        
+        # 1. Lấy proxy VN
+        proxy = proxy_manager.get_vn_proxy()
+        if not proxy:
+            logger.error("❌ Không thể lấy proxy VN")
+            db_manager.update_status(account_id, "failed", last_error="Không thể lấy proxy VN")
+            return False
+        
+        # 2. Start profile với proxy
+        profile_result = gpm_manager.start_profile(profile_id, proxy=proxy)
+        if not profile_result or not profile_result.get("debugPort"):
+            logger.error(f"❌ Không thể start profile {profile_id} hoặc không có debugPort")
+            db_manager.update_status(account_id, "failed-start", last_error="GPM không trả về debugPort")
+            return False
+        
+        debug_port = profile_result["debugPort"]
+        logger.info(f"✅ Profile đã start, debugPort: {debug_port}")
+        
+        # 3. Setup Selenium với remote debugging
+        driver = _setup_selenium(debug_port)
+        if not driver:
+            logger.error("❌ Không thể setup Selenium")
+            db_manager.update_status(account_id, "failed-start", last_error="Không thể khởi tạo Selenium")
+            return False
+        
+        # 4. Điền form Gmail Signup
+        if not _fill_gmail_signup_form(driver, account, screenshots_dir, account_id, db_manager):
+            return False
+        
+        # 5. Xử lý OTP nếu có
+        phone_order = _handle_otp(driver, account, otp_manager, screenshots_dir, account_id, db_manager)
+        if phone_order is False:  # False = failed, None = không cần OTP
+            return False
+        
+        # 6. Xử lý Recovery Email (nếu yêu cầu)
+        recovery_handled = _handle_recovery(
+            driver, account, db_manager, account_id, screenshots_dir, max_wait=300
+        )
+        if not recovery_handled:
+            return False
+        
+        # 7. Detect Captcha/QR và xử lý
+        if _detect_captcha_qr(driver, screenshots_dir, account_id, db_manager):
+            return False  # failed-captcha đã được set trong hàm
+        
+        # 8. Xử lý sau Signup (check bot message, logout, click Complete)
+        success = _handle_post_signup(
+            driver, account, db_manager, account_id, telegram_client, screenshots_dir
+        )
+        
+        return success
+        
+    except Exception as e:
+        logger.error(f"❌ Lỗi không mong đợi trong create_gmail_account: {e}", exc_info=True)
+        _take_screenshot(driver, screenshots_dir, account_id, db_manager, "error")
+        db_manager.update_status(account_id, "error", last_error=str(e))
+        return False
+        
+    finally:
+        # Cleanup
+        if driver:
+            try:
+                driver.quit()
+            except:
+                pass
+        
+        if phone_order:
+            try:
+                otp_manager.cancel_order(phone_order.get("order_id"))
+            except:
+                pass
+        
+        # Stop profile
+        try:
+            gpm_manager.stop_profile(profile_id)
+            db_manager.update_profile_status(profile_id, "idle")
+        except Exception as e:
+            logger.error(f"❌ Lỗi stop profile: {e}")
+
+
+def _setup_selenium(debug_port: int) -> Optional[webdriver.Chrome]:
+    """
+    Setup Selenium với remote debugging port
+    
+    Args:
+        debug_port: Debug port từ GPM
+        
+    Returns:
+        Chrome WebDriver instance hoặc None nếu lỗi
+    """
+    try:
+        chrome_options = Options()
+        chrome_options.add_experimental_option("debuggerAddress", f"localhost:{debug_port}")
+        
+        # Không cần thêm options khác vì GPM đã setup profile
+        
+        driver = webdriver.Chrome(options=chrome_options)
+        logger.info(f"✅ Đã khởi tạo Selenium với debugPort: {debug_port}")
+        return driver
+        
+    except Exception as e:
+        logger.error(f"❌ Lỗi setup Selenium: {e}", exc_info=True)
+        return None
+
+
+def _fill_gmail_signup_form(
+    driver: webdriver.Chrome,
+    account: Dict[str, Any],
+    screenshots_dir: Path,
+    account_id: ObjectId,
+    db_manager: DatabaseManager
+) -> bool:
+    """
+    Điền form Gmail Signup
+    
+    Args:
+        driver: Selenium WebDriver
+        account: Dict chứa thông tin account
+        screenshots_dir: Thư mục lưu screenshots
+        account_id: ObjectId của account
+        db_manager: DatabaseManager instance
+        
+    Returns:
+        True nếu thành công, False nếu thất bại
+    """
+    try:
+        # Navigate đến Gmail Signup
+        logger.info("📝 Đang điều hướng đến Gmail Signup...")
+        driver.get("https://accounts.google.com/signup/v2/webcreateaccount?flowName=GlifWebSignIn&flowEntry=SignUp")
+        
+        Humanizer.random_delay(2, 4)
+        
+        # First Name
+        first_name_elem = Humanizer.wait_for_element(
+            driver, By.ID, "firstName", timeout=10, raise_exception=False
+        )
+        if not first_name_elem:
+            _take_screenshot(driver, screenshots_dir, account_id, db_manager, "form_not_found")
+            db_manager.update_status(account_id, "failed", last_error="Không tìm thấy form First Name")
+            return False
+        
+        Humanizer.type_like_human(first_name_elem, account.get("first_name", ""))
+        Humanizer.random_delay(0.5, 1.5)
+        
+        # Last Name
+        last_name_elem = Humanizer.wait_for_element(
+            driver, By.ID, "lastName", timeout=10, raise_exception=False
+        )
+        if not last_name_elem:
+            _take_screenshot(driver, screenshots_dir, account_id, db_manager, "form_not_found")
+            db_manager.update_status(account_id, "failed", last_error="Không tìm thấy form Last Name")
+            return False
+        
+        Humanizer.type_like_human(last_name_elem, account.get("last_name", ""))
+        Humanizer.random_delay(0.5, 1.5)
+        
+        # Click Next
+        next_button = Humanizer.wait_for_clickable(
+            driver, By.XPATH, "//button[contains(text(), 'Next') or contains(text(), 'Tiếp theo')]", 
+            timeout=10, raise_exception=False
+        )
+        if not next_button:
+            _take_screenshot(driver, screenshots_dir, account_id, db_manager, "next_button_not_found")
+            db_manager.update_status(account_id, "failed", last_error="Không tìm thấy nút Next")
+            return False
+        
+        Humanizer.safe_click(driver, next_button)
+        Humanizer.random_delay(2, 4)
+        
+        # Email (username)
+        # Có thể cần chọn domain hoặc nhập username
+        username_elem = Humanizer.wait_for_element(
+            driver, By.ID, "username", timeout=10, raise_exception=False
+        )
+        if username_elem:
+            email_local = account.get("email", "").split("@")[0]
+            Humanizer.type_like_human(username_elem, email_local)
+            Humanizer.random_delay(0.5, 1.5)
+            
+            # Click Next
+            next_button = Humanizer.wait_for_clickable(
+                driver, By.XPATH, "//button[contains(text(), 'Next') or contains(text(), 'Tiếp theo')]",
+                timeout=10, raise_exception=False
+            )
+            if next_button:
+                Humanizer.safe_click(driver, next_button)
+                Humanizer.random_delay(2, 4)
+        
+        # Password
+        password_elem = Humanizer.wait_for_element(
+            driver, By.NAME, "Passwd", timeout=10, raise_exception=False
+        )
+        if not password_elem:
+            _take_screenshot(driver, screenshots_dir, account_id, db_manager, "password_form_not_found")
+            db_manager.update_status(account_id, "failed", last_error="Không tìm thấy form Password")
+            return False
+        
+        Humanizer.type_like_human(password_elem, account.get("password", ""))
+        Humanizer.random_delay(0.5, 1.5)
+        
+        # Confirm Password
+        confirm_password_elem = Humanizer.wait_for_element(
+            driver, By.NAME, "PasswdAgain", timeout=10, raise_exception=False
+        )
+        if confirm_password_elem:
+            Humanizer.type_like_human(confirm_password_elem, account.get("password", ""))
+            Humanizer.random_delay(0.5, 1.5)
+        
+        # Click Next
+        next_button = Humanizer.wait_for_clickable(
+            driver, By.XPATH, "//button[contains(text(), 'Next') or contains(text(), 'Tiếp theo')]",
+            timeout=10, raise_exception=False
+        )
+        if not next_button:
+            _take_screenshot(driver, screenshots_dir, account_id, db_manager, "next_button_not_found")
+            db_manager.update_status(account_id, "failed", last_error="Không tìm thấy nút Next sau password")
+            return False
+        
+        Humanizer.safe_click(driver, next_button)
+        Humanizer.random_delay(2, 4)
+        
+        logger.info("✅ Đã điền form Gmail Signup")
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ Lỗi điền form Gmail Signup: {e}", exc_info=True)
+        _take_screenshot(driver, screenshots_dir, account_id, db_manager, "form_error")
+        db_manager.update_status(account_id, "failed", last_error=f"Lỗi điền form: {str(e)}")
+        return False
+
+
+def _handle_otp(
+    driver: webdriver.Chrome,
+    account: Dict[str, Any],
+    otp_manager: OTPManager,
+    screenshots_dir: Path,
+    account_id: ObjectId,
+    db_manager: DatabaseManager
+) -> Optional[Dict[str, Any]]:
+    """
+    Xử lý OTP (nếu yêu cầu)
+    
+    Returns:
+        Dict chứa phone_order nếu đã rent phone, False nếu thất bại, None nếu không cần OTP
+    """
+    try:
+        # Kiểm tra có yêu cầu OTP không
+        phone_input = Humanizer.wait_for_element(
+            driver, By.ID, "phoneNumberId", timeout=5, raise_exception=False
+        )
+        
+        if not phone_input:
+            logger.info("ℹ️ Không yêu cầu OTP")
+            return None
+        
+        logger.info("📱 Phát hiện yêu cầu OTP")
+        
+        # Rent phone
+        phone_order = otp_manager.rent_phone("VN")
+        if not phone_order:
+            logger.error("❌ Không thể rent phone")
+            _take_screenshot(driver, screenshots_dir, account_id, db_manager, "otp_rent_failed")
+            db_manager.update_status(account_id, "failed-phone", last_error="Không thể rent phone")
+            return False
+        
+        phone_number = phone_order.get("phone_number")
+        logger.info(f"✅ Đã rent phone: {phone_number}")
+        
+        # Nhập phone number
+        Humanizer.type_like_human(phone_input, phone_number)
+        Humanizer.random_delay(0.5, 1.5)
+        
+        # Click Next
+        next_button = Humanizer.wait_for_clickable(
+            driver, By.XPATH, "//button[contains(text(), 'Next') or contains(text(), 'Tiếp theo')]",
+            timeout=10, raise_exception=False
+        )
+        if next_button:
+            Humanizer.safe_click(driver, next_button)
+            Humanizer.random_delay(2, 4)
+        
+        # Đợi input OTP code
+        code_input = Humanizer.wait_for_element(
+            driver, By.ID, "code", timeout=30, raise_exception=False
+        )
+        if not code_input:
+            logger.error("❌ Không tìm thấy input OTP code")
+            _take_screenshot(driver, screenshots_dir, account_id, db_manager, "otp_input_not_found")
+            db_manager.update_status(account_id, "failed-phone", last_error="Không tìm thấy input OTP")
+            return False
+        
+        # Poll OTP code với retry 3 lần
+        otp_code = otp_manager.get_code(phone_order.get("order_id"), max_attempts=3)
+        
+        if not otp_code:
+            logger.error("❌ Không nhận được OTP code sau 3 attempts")
+            _take_screenshot(driver, screenshots_dir, account_id, db_manager, "otp_timeout")
+            db_manager.update_status(account_id, "failed-phone", last_error="Không nhận được OTP code")
+            return False
+        
+        # Nhập OTP code
+        Humanizer.type_like_human(code_input, otp_code)
+        Humanizer.random_delay(0.5, 1.5)
+        
+        # Click Next/Verify
+        verify_button = Humanizer.wait_for_clickable(
+            driver, By.XPATH, 
+            "//button[contains(text(), 'Next') or contains(text(), 'Verify') or contains(text(), 'Xác minh')]",
+            timeout=10, raise_exception=False
+        )
+        if verify_button:
+            Humanizer.safe_click(driver, verify_button)
+            Humanizer.random_delay(2, 4)
+        
+        logger.info("✅ Đã xử lý OTP thành công")
+        return phone_order
+        
+    except Exception as e:
+        logger.error(f"❌ Lỗi xử lý OTP: {e}", exc_info=True)
+        _take_screenshot(driver, screenshots_dir, account_id, db_manager, "otp_error")
+        db_manager.update_status(account_id, "failed-phone", last_error=f"Lỗi OTP: {str(e)}")
+        return False
+
+
+def _handle_recovery(
+    driver: webdriver.Chrome,
+    account: Dict[str, Any],
+    db_manager: DatabaseManager,
+    account_id: ObjectId,
+    screenshots_dir: Path,
+    max_wait: int = 300
+) -> bool:
+    """
+    Xử lý Recovery Email (đợi và resume khi nhận được)
+    
+    Args:
+        driver: Selenium WebDriver
+        account: Dict chứa thông tin account
+        db_manager: DatabaseManager instance
+        account_id: ObjectId của account
+        screenshots_dir: Thư mục lưu screenshots
+        max_wait: Thời gian đợi tối đa (giây)
+        
+    Returns:
+        True nếu thành công, False nếu thất bại
+    """
+    try:
+        # Kiểm tra có yêu cầu Recovery Email không
+        recovery_input = Humanizer.wait_for_element(
+            driver, By.ID, "recoveryEmailId", timeout=5, raise_exception=False
+        )
+        
+        if not recovery_input:
+            logger.info("ℹ️ Không yêu cầu Recovery Email")
+            return True
+        
+        logger.info("📧 Phát hiện yêu cầu Recovery Email")
+        
+        # Set status = "waiting-recovery"
+        db_manager.update_status(account_id, "waiting-recovery")
+        logger.info("⏳ Đang đợi recovery email từ operator...")
+        
+        # Đợi status chuyển thành "recovery-received" (từ telegram_listener)
+        start_time = time.time()
+        check_interval = 2  # Kiểm tra mỗi 2 giây
+        
+        while time.time() - start_time < max_wait:
+            # Lấy account mới nhất từ DB
+            from bson import ObjectId
+            updated_account = db_manager.accounts.find_one({"_id": account_id})
+            
+            if updated_account and updated_account.get("status") == "recovery-received":
+                recovery_email = updated_account.get("recovery_email")
+                if recovery_email:
+                    logger.info(f"✅ Đã nhận recovery email: {recovery_email}")
+                    
+                    # Nhập recovery email
+                    Humanizer.type_like_human(recovery_input, recovery_email)
+                    Humanizer.random_delay(0.5, 1.5)
+                    
+                    # Click Next
+                    next_button = Humanizer.wait_for_clickable(
+                        driver, By.XPATH, "//button[contains(text(), 'Next') or contains(text(), 'Tiếp theo')]",
+                        timeout=10, raise_exception=False
+                    )
+                    if next_button:
+                        Humanizer.safe_click(driver, next_button)
+                        Humanizer.random_delay(2, 4)
+                    
+                    logger.info("✅ Đã nhập recovery email thành công")
+                    return True
+            
+            # Kiểm tra có lỗi không
+            if updated_account and updated_account.get("status") == "waiting-observe":
+                logger.warning("⚠️ Account đã được set waiting-observe, dừng đợi recovery")
+                return False
+            
+            time.sleep(check_interval)
+        
+        logger.error(f"❌ Timeout đợi recovery email sau {max_wait}s")
+        _take_screenshot(driver, screenshots_dir, account_id, db_manager, "recovery_timeout")
+        db_manager.update_status(account_id, "failed", last_error="Timeout đợi recovery email")
+        return False
+        
+    except Exception as e:
+        logger.error(f"❌ Lỗi xử lý Recovery: {e}", exc_info=True)
+        _take_screenshot(driver, screenshots_dir, account_id, db_manager, "recovery_error")
+        db_manager.update_status(account_id, "failed", last_error=f"Lỗi recovery: {str(e)}")
+        return False
+
+
+def _detect_captcha_qr(
+    driver: webdriver.Chrome,
+    screenshots_dir: Path,
+    account_id: ObjectId,
+    db_manager: DatabaseManager
+) -> bool:
+    """
+    Detect Captcha/QR Code
+    
+    Returns:
+        True nếu phát hiện Captcha/QR (đã set failed-captcha), False nếu không
+    """
+    try:
+        # Kiểm tra các indicator của Captcha/QR
+        captcha_indicators = [
+            "captcha",
+            "recaptcha",
+            "verify you're human",
+            "scan this qr",
+            "qr code"
+        ]
+        
+        page_source_lower = driver.page_source.lower()
+        
+        for indicator in captcha_indicators:
+            if indicator in page_source_lower:
+                logger.warning(f"⚠️ Phát hiện {indicator}")
+                _take_screenshot(driver, screenshots_dir, account_id, db_manager, "captcha_detected")
+                db_manager.update_status(account_id, "failed-captcha", last_error=f"Phát hiện {indicator}")
+                return True
+        
+        # Kiểm tra element captcha (nếu có)
+        captcha_frame = Humanizer.wait_for_element(
+            driver, By.CSS_SELECTOR, "iframe[src*='recaptcha']", timeout=2, raise_exception=False
+        )
+        if captcha_frame:
+            logger.warning("⚠️ Phát hiện reCAPTCHA iframe")
+            _take_screenshot(driver, screenshots_dir, account_id, db_manager, "captcha_detected")
+            db_manager.update_status(account_id, "failed-captcha", last_error="Phát hiện reCAPTCHA")
+            return True
+        
+        return False
+        
+    except Exception as e:
+        logger.error(f"❌ Lỗi detect captcha: {e}")
+        return False
+
+
+def _handle_post_signup(
+    driver: webdriver.Chrome,
+    account: Dict[str, Any],
+    db_manager: DatabaseManager,
+    account_id: ObjectId,
+    telegram_client: TelegramClient,
+    screenshots_dir: Path
+) -> bool:
+    """
+    Xử lý sau Signup: check bot message, logout, click Complete
+    
+    Returns:
+        True nếu thành công, False nếu thất bại
+    """
+    try:
+        # Đợi một chút để bot có thời gian gửi message (nếu có)
+        Humanizer.random_delay(3, 5)
+        
+        # TODO: Kiểm tra bot message (cần tích hợp với telegram_listener hoặc query messages)
+        # Tạm thời coi như thành công nếu không có error
+        
+        # Logout Gmail
+        logger.info("🚪 Đang logout Gmail...")
+        try:
+            # Có thể cần navigate đến account settings hoặc dùng URL logout
+            driver.get("https://accounts.google.com/Logout")
+            Humanizer.random_delay(2, 4)
+        except:
+            logger.warning("⚠️ Không thể logout, tiếp tục...")
+        
+        # Update DB: status="waiting-complete"
+        db_manager.update_status(account_id, "waiting-complete")
+        logger.info("✅ Đã set status=waiting-complete")
+        
+        # Tự động nhấn nút Complete trên Telegram
+        success = _click_complete_button(
+            telegram_client,
+            account,
+            db_manager,
+            account_id,
+            screenshots_dir
+        )
+        
+        if success:
+            db_manager.update_status(account_id, "created")
+            logger.info("✅ Account đã được tạo thành công (status=created)")
+            return True
+        else:
+            logger.error("❌ Không thể click Complete button")
+            return False
+        
+    except Exception as e:
+        logger.error(f"❌ Lỗi xử lý post-signup: {e}", exc_info=True)
+        _take_screenshot(driver, screenshots_dir, account_id, db_manager, "post_signup_error")
+        db_manager.update_status(account_id, "failed", last_error=f"Lỗi post-signup: {str(e)}")
+        return False
+
+
+def _click_complete_button(
+    telegram_client: TelegramClient,
+    account: Dict[str, Any],
+    db_manager: DatabaseManager,
+    account_id: ObjectId,
+    screenshots_dir: Path
+) -> bool:
+    """
+    Tự động nhấn nút Complete trên Telegram với retry 3 lần
+    
+    Returns:
+        True nếu thành công, False nếu thất bại
+    """
+    try:
+        message_chat_id = account.get("message_chat_id") or account.get("source_chat_id")
+        message_id_input = account.get("message_id_input")
+        
+        if not message_chat_id or not message_id_input:
+            logger.error("❌ Thiếu message_chat_id hoặc message_id_input")
+            db_manager.update_status(
+                account_id, "waiting-observe",
+                last_error="Thiếu metadata để click Complete button"
+            )
+            return False
+        
+        # Retry tối đa 3 lần trong 10 giây
+        max_retries = 3
+        retry_delay = 10 / max_retries  # Chia đều trong 10 giây
+        
+        for attempt in range(max_retries):
+            try:
+                logger.info(f"🔄 Attempt {attempt + 1}/{max_retries} - Đang click Complete button...")
+                
+                # Lấy message để tìm button
+                message = asyncio.run_coroutine_threadsafe(
+                    telegram_client.get_messages(message_chat_id, ids=message_id_input),
+                    telegram_client.loop
+                ).result()
+                
+                if not message:
+                    logger.warning(f"⚠️ Không tìm thấy message {message_id_input}")
+                    if attempt < max_retries - 1:
+                        time.sleep(retry_delay)
+                        continue
+                    else:
+                        db_manager.update_status(
+                            account_id, "waiting-observe",
+                            last_error=f"Không tìm thấy message {message_id_input}"
+                        )
+                        return False
+                
+                # Tìm button "Complete" hoặc "❤️ Complete" trong reply_markup
+                button_data = None
+                if message.reply_markup:
+                    for row in message.reply_markup.rows:
+                        for button in row.buttons:
+                            button_text = getattr(button, 'text', '') or ''
+                            if 'complete' in button_text.lower() or '❤️' in button_text:
+                                button_data = getattr(button, 'data', None)
+                                if button_data:
+                                    logger.info(f"✅ Tìm thấy Complete button với data: {button_data}")
+                                    break
+                        if button_data:
+                            break
+                
+                if not button_data:
+                    logger.warning("⚠️ Không tìm thấy Complete button trong message")
+                    if attempt < max_retries - 1:
+                        time.sleep(retry_delay)
+                        continue
+                    else:
+                        db_manager.update_status(
+                            account_id, "waiting-observe",
+                            last_error="Không tìm thấy Complete button trong message"
+                        )
+                        return False
+                
+                # Click button bằng GetBotCallbackAnswerRequest
+                result = asyncio.run_coroutine_threadsafe(
+                    telegram_client(GetBotCallbackAnswerRequest(
+                        peer=message_chat_id,
+                        msg_id=message_id_input,
+                        data=button_data
+                    )),
+                    telegram_client.loop
+                ).result()
+                
+                if result:
+                    logger.info("✅ Đã click Complete button thành công")
+                    return True
+                    
+            except Exception as e:
+                logger.warning(f"⚠️ Lỗi click Complete attempt {attempt + 1}: {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+                else:
+                    logger.error("❌ Không thể click Complete sau 3 attempts")
+                    db_manager.update_status(
+                        account_id, "waiting-observe",
+                        last_error=f"Không thể click Complete: {str(e)}"
+                    )
+                    return False
+        
+        return False
+        
+    except Exception as e:
+        logger.error(f"❌ Lỗi click_complete_button: {e}", exc_info=True)
+        db_manager.update_status(
+            account_id, "waiting-observe",
+            last_error=f"Lỗi click Complete: {str(e)}"
+        )
+        return False
+
+
+def _take_screenshot(
+    driver: Optional[webdriver.Chrome],
+    screenshots_dir: Path,
+    account_id: ObjectId,
+    db_manager: DatabaseManager,
+    suffix: str = ""
+):
+    """
+    Chụp screenshot và lưu vào DB
+    
+    Args:
+        driver: Selenium WebDriver
+        screenshots_dir: Thư mục lưu screenshots
+        account_id: ObjectId của account
+        db_manager: DatabaseManager instance
+        suffix: Suffix cho tên file
+    """
+    try:
+        if not driver:
+            return
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"account_{account_id}_{suffix}_{timestamp}.png"
+        filepath = screenshots_dir / filename
+        
+        driver.save_screenshot(str(filepath))
+        
+        # Update DB với screenshot_path
+        db_manager.update_status(account_id, None, screenshot_path=str(filepath))
+        
+        logger.info(f"📸 Đã chụp screenshot: {filepath}")
+        
+    except Exception as e:
+        logger.error(f"❌ Lỗi chụp screenshot: {e}")
+
