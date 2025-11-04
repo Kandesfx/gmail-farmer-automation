@@ -146,7 +146,7 @@ class DatabaseManager:
                 valid_statuses = [
                     "pending", "creating", "waiting-recovery", "recovery-received",
                     "waiting-complete", "waiting-observe", "created",
-                    "failed-phone", "failed-captcha", "failed", "error"
+                    "failed-phone", "failed-captcha", "failed-start", "failed", "error"
                 ]
                 if new_status not in valid_statuses:
                     logger.error(f"❌ Trạng thái không hợp lệ: {new_status}")

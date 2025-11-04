@@ -10,10 +10,12 @@ from typing import Optional, Dict, Any
 from datetime import datetime
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, WebDriverException
+from webdriver_manager.chrome import ChromeDriverManager
 from bson import ObjectId
 from telethon import TelegramClient
 from telethon.tl.functions.messages import GetBotCallbackAnswerRequest
@@ -109,9 +111,11 @@ def create_gmail_account(
         logger.info(f"🔗 Đang gán proxy cho profile {profile_id}...")
         try:
             # Gán proxy và validate (FAIL-FAST nếu lỗi)
+            # Theo code mẫu Bot1: Proxy từ config có thể skip validation
             proxy = proxy_manager.assign_proxy_for_profile(
                 profile_id=profile_id,
-                change_ip=False  # Không xoay IP mỗi lần tạo account (có thể bật nếu cần)
+                change_ip=False,  # Không xoay IP mỗi lần tạo account (có thể bật nếu cần)
+                skip_validation=False  # Validate proxy (set True nếu proxy đã được verify từ config)
             )
             logger.info(f"✅ Đã gán proxy thành công: {proxy['host']}:{proxy.get('port', 'N/A')}")
         except RuntimeError as proxy_error:
@@ -145,10 +149,21 @@ def create_gmail_account(
         if not profile_result or not debug_port:
             error_msg = f"GPM không trả về remote_debugging_port cho profile {profile_id}"
             logger.error(f"❌ {error_msg} - FAIL-FAST")
+            
+            # Đánh dấu profile là error để không dùng nữa
+            # Profile có thể bị PROFILE_IN_TRASH hoặc các lỗi khác
+            try:
+                logger.warning(f"⚠️ Profile {profile_id} không thể start, đánh dấu profile là error")
+                db_manager.update_profile_status(profile_id, "error")
+                logger.info(f"   💡 Profile đã được đánh dấu 'error', sẽ không được chọn lại")
+                logger.info(f"   💡 Nếu profile bị PROFILE_IN_TRASH, vui lòng khôi phục từ GPM dashboard")
+            except Exception as profile_update_error:
+                logger.warning(f"⚠️ Không thể update profile status: {profile_update_error}")
+            
             _take_screenshot(driver, screenshots_dir, account_id, db_manager, "start_profile_failed")
             db_manager.update_status(account_id, "failed-start", last_error=error_msg)
+            
             # Profile chưa start thành công, không cần stop
-            db_manager.update_profile_status(profile_id, "idle")  # Rollback profile status
             return False
         
         logger.info(f"✅ Profile đã start, remote_debugging_port: {debug_port}")
@@ -253,6 +268,7 @@ def create_gmail_account(
 def _setup_selenium(debug_port: int) -> Optional[webdriver.Chrome]:
     """
     Setup Selenium với remote debugging port
+    Tự động download ChromeDriver phù hợp với Chrome version
     
     Args:
         debug_port: Debug port từ GPM
@@ -266,12 +282,20 @@ def _setup_selenium(debug_port: int) -> Optional[webdriver.Chrome]:
         
         # Không cần thêm options khác vì GPM đã setup profile
         
-        driver = webdriver.Chrome(options=chrome_options)
+        # Sử dụng webdriver-manager để tự động download ChromeDriver phù hợp
+        logger.debug(f"   Đang setup ChromeDriver (tự động download nếu cần)...")
+        service = Service(ChromeDriverManager().install())
+        
+        driver = webdriver.Chrome(service=service, options=chrome_options)
         logger.info(f"✅ Đã khởi tạo Selenium với debugPort: {debug_port}")
         return driver
         
     except Exception as e:
         logger.error(f"❌ Lỗi setup Selenium: {e}", exc_info=True)
+        logger.error(f"   💡 Gợi ý:")
+        logger.error(f"      - Kiểm tra Chrome browser đã được cài đặt chưa")
+        logger.error(f"      - Kiểm tra network có thể download ChromeDriver không")
+        logger.error(f"      - Thử update Chrome browser lên phiên bản mới nhất")
         return None
 
 

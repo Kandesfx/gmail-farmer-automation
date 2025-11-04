@@ -42,7 +42,13 @@ GPM_API_KEY = os.getenv("GPM_API_KEY", "")  # Để trống nếu dùng local GP
 
 # ZingProxy API Configuration
 ZINGPROXY_API_URL = os.getenv("ZINGPROXY_API_URL", "https://api.zingproxy.com")
-ZINGPROXY_API_KEY = os.getenv("ZINGPROXY_API_KEY", "")
+ZINGPROXY_API_KEY = os.getenv("ZINGPROXY_API_KEY", "")  # Deprecated: giữ để tương thích
+
+# ZingProxy Proxy Key - API Key của proxy cụ thể
+# Lấy từ dashboard ZingProxy: Vào chi tiết proxy → Copy API Key của proxy
+# Endpoint: https://api.zingproxy.com/get-proxy?key={API_KEY_CỦA_PROXY}
+# Không cần Bearer token, chỉ cần query parameter
+ZINGPROXY_PROXY_KEY = os.getenv("ZINGPROXY_PROXY_KEY", "")
 
 # ZingProxy Change IP Link - Lấy từ dashboard ZingProxy (Link change IP)
 # Format: https://api.zingproxy.com/getip/{api_key}

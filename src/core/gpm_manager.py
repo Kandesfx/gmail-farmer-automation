@@ -95,6 +95,12 @@ class GPMManager:
                     if not response_data.get("success", False):
                         error_msg = response_data.get("message", "Unknown error")
                         logger.error(f"❌ API trả về lỗi khi start profile {profile_id}: {error_msg}")
+                        
+                        # Xử lý các lỗi đặc biệt
+                        if error_msg == "PROFILE_IN_TRASH":
+                            logger.error(f"   💡 Profile đang ở trong thùng rác (trash), không thể sử dụng")
+                            logger.error(f"   💡 Vui lòng khôi phục profile từ GPM dashboard hoặc xóa profile khỏi MongoDB")
+                        
                         return None
                     # Lấy data từ field "data"
                     data = response_data.get("data", {})
