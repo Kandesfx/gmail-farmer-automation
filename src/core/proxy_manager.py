@@ -201,59 +201,77 @@ class ProxyManager:
                         time.sleep(wait_time)
                     continue
                 
-                # Parse httpProxy: "103.139.44.48:5677:xefzoorz:xeFZOOrZ"
+                # Ưu tiên validate socks5Proxy, fallback sang httpProxy
+                socks5_proxy_str = proxy_data.get("socks5Proxy", "")
                 http_proxy_str = proxy_data.get("httpProxy", "")
-                if not http_proxy_str:
-                    logger.error(f"   ❌ Proxy data không có httpProxy")
-                    last_error = "Missing 'httpProxy' in proxy data"
+                
+                api_proxy_str = ""
+                api_proxy_type = ""
+                
+                if socks5_proxy_str:
+                    api_proxy_str = socks5_proxy_str
+                    api_proxy_type = "SOCKS5"
+                    logger.debug(f"   ✅ Parse được socks5Proxy từ API: {socks5_proxy_str[:50]}...")
+                elif http_proxy_str:
+                    api_proxy_str = http_proxy_str
+                    api_proxy_type = "HTTP"
+                    logger.debug(f"   ✅ Parse được httpProxy từ API: {http_proxy_str[:50]}...")
+                else:
+                    logger.error(f"   ❌ Proxy data không có cả socks5Proxy và httpProxy")
+                    last_error = "Missing both 'socks5Proxy' and 'httpProxy' in proxy data"
+                    logger.error(f"   💡 Gợi ý: Kiểm tra proxy từ ZingProxy có hỗ trợ socks5Proxy hoặc httpProxy không")
                     if attempt < max_retries:
                         wait_time = attempt * 2
                         time.sleep(wait_time)
                     continue
                 
-                # Parse: host:port:username:password
-                try:
-                    parts = http_proxy_str.split(":")
-                    if len(parts) < 4:
-                        logger.error(f"   ❌ Format httpProxy không hợp lệ: {http_proxy_str}")
-                        logger.error(f"   Expected format: host:port:username:password")
-                        last_error = f"Invalid httpProxy format: {http_proxy_str}"
-                        if attempt < max_retries:
-                            wait_time = attempt * 2
-                            time.sleep(wait_time)
-                        continue
-                    
-                    api_proxy_host = parts[0]
-                    api_proxy_port = parts[1]
-                    api_proxy_user = parts[2]
-                    api_proxy_pass = ":".join(parts[3:])  # Password có thể chứa ":"
-                    
-                    logger.debug(f"   ✅ Parse được proxy từ API: {api_proxy_host}:{api_proxy_port}")
-                    
-                    # So sánh với proxy hiện tại (chỉ so host và port, username/password có thể khác)
-                    if api_proxy_host == proxy.get("host") and api_proxy_port == str(proxy.get("port")):
-                        logger.info(f"✅ Proxy validation thành công - Proxy hợp lệ từ ZingProxy API")
-                        logger.debug(f"   Proxy hiện tại khớp với API: {api_proxy_host}:{api_proxy_port}")
+                # So sánh với proxy hiện tại
+                proxy_socks5_raw = proxy.get("socks5_raw", "")
+                proxy_http_raw = proxy.get("http_raw", "")
+                
+                # So sánh với socks5_raw (nếu có)
+                if proxy_socks5_raw and api_proxy_type == "SOCKS5":
+                    if socks5_proxy_str == proxy_socks5_raw:
+                        logger.info(f"✅ Proxy validation thành công - {api_proxy_type} proxy hợp lệ từ ZingProxy API")
+                        logger.debug(f"   Proxy hiện tại khớp với API")
                         logger.debug(f"   Proxy ID: {proxy_data.get('uId')}, Resource ID: {proxy_data.get('resourceId')}")
                         return True
                     else:
-                        # Proxy từ API khác với proxy hiện tại (có thể IP đã xoay)
-                        logger.warning(f"⚠️ Proxy từ API khác với proxy hiện tại:")
-                        logger.warning(f"   API: {api_proxy_host}:{api_proxy_port}")
-                        logger.warning(f"   Hiện tại: {proxy.get('host')}:{proxy.get('port')}")
-                        logger.warning(f"   Có thể IP đã được xoay hoặc proxy đã được cập nhật")
-                        # Vẫn OK vì API trả về success và có proxy hợp lệ
-                        logger.info(f"✅ Proxy validation thành công - API trả về proxy hợp lệ (có thể IP đã xoay)")
+                        logger.warning(f"⚠️ Proxy từ API khác với proxy hiện tại (có thể IP đã xoay)")
+                        logger.info(f"✅ Proxy validation thành công - API trả về {api_proxy_type} proxy hợp lệ (có thể IP đã xoay)")
                         logger.debug(f"   Proxy ID: {proxy_data.get('uId')}, Resource ID: {proxy_data.get('resourceId')}")
                         return True
-                        
+                
+                # So sánh với http_raw (nếu có)
+                if proxy_http_raw and api_proxy_type == "HTTP":
+                    if http_proxy_str == proxy_http_raw:
+                        logger.info(f"✅ Proxy validation thành công - {api_proxy_type} proxy hợp lệ từ ZingProxy API")
+                        logger.debug(f"   Proxy hiện tại khớp với API")
+                        logger.debug(f"   Proxy ID: {proxy_data.get('uId')}, Resource ID: {proxy_data.get('resourceId')}")
+                        return True
+                    else:
+                        logger.warning(f"⚠️ Proxy từ API khác với proxy hiện tại (có thể IP đã xoay)")
+                        logger.info(f"✅ Proxy validation thành công - API trả về {api_proxy_type} proxy hợp lệ (có thể IP đã xoay)")
+                        logger.debug(f"   Proxy ID: {proxy_data.get('uId')}, Resource ID: {proxy_data.get('resourceId')}")
+                        return True
+                
+                # Nếu không có raw string, so sánh host và port (fallback)
+                try:
+                    parts = api_proxy_str.split(":")
+                    api_proxy_host = parts[0] if len(parts) > 0 else ""
+                    api_proxy_port = parts[1] if len(parts) > 1 else ""
+                    
+                    if api_proxy_host == proxy.get("host") and api_proxy_port == str(proxy.get("port")):
+                        logger.info(f"✅ Proxy validation thành công - {api_proxy_type} proxy hợp lệ từ ZingProxy API")
+                        return True
+                    else:
+                        logger.warning(f"⚠️ Proxy từ API khác với proxy hiện tại")
+                        logger.info(f"✅ Proxy validation thành công - API trả về {api_proxy_type} proxy hợp lệ")
+                        return True
                 except Exception as parse_error:
-                    logger.error(f"   ❌ Lỗi parse httpProxy '{http_proxy_str}': {parse_error}")
-                    last_error = f"Parse error: {parse_error}"
-                    if attempt < max_retries:
-                        wait_time = attempt * 2
-                        time.sleep(wait_time)
-                    continue
+                    logger.warning(f"⚠️ Không thể so sánh proxy, nhưng API trả về success")
+                    logger.info(f"✅ Proxy validation thành công - API trả về {api_proxy_type} proxy hợp lệ")
+                    return True
                     
             except requests.exceptions.Timeout as e:
                 logger.debug(f"   ⏱️ Timeout sau {timeout}s: {str(e)[:100]}")
@@ -388,6 +406,9 @@ class ProxyManager:
                 username=self.default_user,
                 password=self.default_pass
             )
+            
+            # Set proxy_type là "socks5" khi lấy từ .env (mặc định dùng socks5)
+            proxy["proxy_type"] = "socks5"
             
             logger.info(f"✅ Đã lấy default proxy từ .env config (fallback): {proxy['host']}:{proxy['port']}")
             return proxy
@@ -527,41 +548,50 @@ class ProxyManager:
                 logger.error(f"   Response: {data}")
                 return None
             
-            # Parse httpProxy format: "103.139.44.48:5677:xefzoorz:xeFZOOrZ"
+            # Ưu tiên dùng socks5Proxy, fallback sang httpProxy nếu không có
+            socks5_proxy_str = proxy_data.get("socks5Proxy", "")
             http_proxy_str = proxy_data.get("httpProxy", "")
-            if not http_proxy_str:
-                logger.error("❌ Proxy data không có httpProxy")
+            
+            proxy = {}
+            proxy_raw = ""
+            proxy_type = ""
+            
+            if socks5_proxy_str:
+                logger.info("✅ Sử dụng socks5Proxy từ API")
+                proxy_raw = socks5_proxy_str
+                proxy_type = "socks5"
+                proxy["socks5_raw"] = socks5_proxy_str
+            elif http_proxy_str:
+                logger.info("✅ Sử dụng httpProxy từ API (fallback)")
+                logger.warning("   ⚠️ Không có socks5Proxy, đang dùng httpProxy")
+                proxy_raw = http_proxy_str
+                proxy_type = "http"
+                proxy["http_raw"] = http_proxy_str
+            else:
+                logger.error("❌ Proxy data không có cả socks5Proxy và httpProxy")
                 logger.error(f"   Proxy data: {proxy_data}")
+                logger.error(f"   💡 Gợi ý: Kiểm tra proxy từ ZingProxy có hỗ trợ socks5Proxy hoặc httpProxy không")
                 return None
             
-            # Parse: host:port:username:password
+            proxy["proxy_type"] = proxy_type
+            
+            # Parse để lấy thông tin riêng lẻ (dùng cho validation và logging)
             try:
-                parts = http_proxy_str.split(":")
-                if len(parts) < 4:
-                    logger.error(f"❌ Format httpProxy không hợp lệ: {http_proxy_str}")
-                    logger.error(f"   Expected format: host:port:username:password")
-                    return None
-                
-                proxy_host = parts[0]
-                proxy_port = parts[1]
-                proxy_user = parts[2]
-                proxy_pass = ":".join(parts[3:])  # Password có thể chứa ":"
-                
-                logger.debug(f"   ✅ Parse được proxy: {proxy_host}:{proxy_port} (user: {proxy_user})")
-                
+                parts = proxy_raw.split(":")
+                if len(parts) >= 2:
+                    proxy["host"] = parts[0]
+                    proxy["port"] = parts[1]
+                    if len(parts) >= 3:
+                        proxy["username"] = parts[2]
+                    if len(parts) >= 4:
+                        proxy["password"] = ":".join(parts[3:])  # Password có thể chứa ":"
+                    
+                    logger.debug(f"   ✅ Parse được {proxy_type} proxy: {proxy.get('host')}:{proxy.get('port')}")
             except Exception as parse_error:
-                logger.error(f"❌ Lỗi parse httpProxy '{http_proxy_str}': {parse_error}")
-                return None
+                logger.warning(f"⚠️ Không thể parse {proxy_type}Proxy để lấy thông tin chi tiết: {parse_error}")
+                logger.warning(f"   Sẽ dùng nguyên vẹn chuỗi: {proxy_raw[:50]}...")
             
-            # Build proxy object
-            proxy = self.build_proxy_object_from_raw(
-                host=proxy_host,
-                port=proxy_port,
-                username=proxy_user,
-                password=proxy_pass
-            )
-            
-            logger.info(f"✅ Đã lấy proxy theo key: {proxy['host']}:{proxy['port']}")
+            logger.info(f"✅ Đã lấy {proxy_type}Proxy theo key: {proxy_raw[:50]}...")
             logger.debug(f"   Proxy ID: {proxy_data.get('uId')}")
             logger.debug(f"   Resource ID: {proxy_data.get('resourceId')}")
             logger.debug(f"   Date End: {proxy_data.get('dateEnd')}")

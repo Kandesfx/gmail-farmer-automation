@@ -146,7 +146,7 @@ class DatabaseManager:
                 valid_statuses = [
                     "pending", "creating", "waiting-recovery", "recovery-received",
                     "waiting-complete", "waiting-observe", "created",
-                    "failed-phone", "failed-captcha", "failed-start", "failed", "error"
+                    "failed-phone", "failed-captcha", "failed-start", "failed-proxy", "failed", "error"
                 ]
                 if new_status not in valid_statuses:
                     logger.error(f"❌ Trạng thái không hợp lệ: {new_status}")
@@ -190,18 +190,19 @@ class DatabaseManager:
             Dict chứa thông tin account, hoặc None nếu không có
         """
         try:
-            # Các status cần loại trừ (created + các status đang xử lý)
+            # Các status cần loại trừ (created + các status đang xử lý + failed-proxy)
             excluded_statuses = [
                 "created",  # Đã hoàn thành - không lấy
                 "creating",  # Đang được xử lý
                 "waiting-recovery",  # Đang đợi recovery
                 "recovery-received",  # Đã nhận recovery
                 "waiting-complete",  # Đang đợi complete
-                "waiting-observe"  # Đang đợi operator can thiệp
+                "waiting-observe",  # Đang đợi operator can thiệp
+                "failed-proxy"  # Lỗi proxy nghiêm trọng - không retry (profile đã bị kill)
             ]
             
             # Query: status không nằm trong danh sách loại trừ
-            # → Lấy: pending, failed, failed-phone, failed-captcha, error
+            # → Lấy: pending, failed, failed-phone, failed-captcha, error (KHÔNG lấy failed-proxy)
             query = {
                 "status": {"$nin": excluded_statuses}
             }
@@ -232,18 +233,19 @@ class DatabaseManager:
             Số lượng accounts có thể xử lý
         """
         try:
-            # Các status cần loại trừ (created + các status đang xử lý)
+            # Các status cần loại trừ (created + các status đang xử lý + failed-proxy)
             excluded_statuses = [
                 "created",  # Đã hoàn thành - không đếm
                 "creating",  # Đang được xử lý
                 "waiting-recovery",  # Đang đợi recovery
                 "recovery-received",  # Đã nhận recovery
                 "waiting-complete",  # Đang đợi complete
-                "waiting-observe"  # Đang đợi operator can thiệp
+                "waiting-observe",  # Đang đợi operator can thiệp
+                "failed-proxy"  # Lỗi proxy nghiêm trọng - không retry (profile đã bị kill)
             ]
             
             # Query: status không nằm trong danh sách loại trừ
-            # → Đếm: pending, failed, failed-phone, failed-captcha, error
+            # → Đếm: pending, failed, failed-phone, failed-captcha, error (KHÔNG đếm failed-proxy)
             query = {
                 "status": {"$nin": excluded_statuses}
             }

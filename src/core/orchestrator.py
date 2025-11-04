@@ -271,56 +271,6 @@ class Orchestrator:
             if not pending_account:
                 return
             
-            # Tối ưu: Cache kết quả query idle profile
-            # Lưu ý: Không cache None quá lâu (chỉ 5 giây) để tránh block quá lâu
-            idle_profile = None
-            profile_cache_ttl = 10  # Cache khi có profile
-            profile_cache_ttl_none = 5  # Cache ngắn hơn khi không có profile (để retry nhanh hơn)
-            
-            # Xác định cache TTL dựa trên kết quả cache hiện tại
-            cache_age = current_time - self._last_idle_profile_query
-            cache_is_valid = False
-            
-            if self._last_idle_profile_result:
-                # Có profile trong cache → cache 10 giây
-                cache_is_valid = cache_age < profile_cache_ttl
-            else:
-                # Không có profile trong cache (None) → cache chỉ 5 giây
-                cache_is_valid = cache_age < profile_cache_ttl_none
-            
-            if cache_is_valid:
-                # Sử dụng cache
-                idle_profile = self._last_idle_profile_result
-                if idle_profile:
-                    logger.debug(f"ℹ️ Sử dụng cached idle profile: {idle_profile.get('profile_id')}")
-                else:
-                    # Cache đang lưu None - log để người dùng biết
-                    time_until_retry = profile_cache_ttl_none - cache_age
-                    logger.warning(f"⚠️ Không có idle profile (đang dùng cache). Sẽ thử lại sau {time_until_retry:.0f} giây...")
-            else:
-                # Query mới (cache đã hết hạn)
-                idle_profile = self.db_manager.get_idle_profile()
-                self._last_idle_profile_result = idle_profile
-                self._last_idle_profile_query = current_time
-                
-                if idle_profile:
-                    logger.info(f"✅ Tìm thấy idle profile: {idle_profile.get('profile_id')}")
-                else:
-                    logger.warning("⚠️ KHÔNG TÌM THẤY IDLE PROFILE trong DB. Vui lòng:")
-                    logger.warning("   1. Kiểm tra GPM có profile nào không")
-                    logger.warning("   2. Đảm bảo profile có status='idle' trong MongoDB")
-                    logger.warning("   3. Nếu profile đang 'in_use', đợi worker hoàn thành hoặc reset thủ công")
-            
-            if not idle_profile:
-                logger.info(f"⏸️ Tạm dừng: Đã có pending account '{pending_account.get('email')}' nhưng chưa có idle profile")
-                return
-            
-            logger.info(
-                f"🎯 Phát hiện task: account={pending_account.get('email')} "
-                f"(ID: {pending_account.get('_id')}), "
-                f"profile={idle_profile.get('profile_id')}"
-            )
-            
             # Kiểm tra account này đã có worker chưa
             account_id_str = str(pending_account.get("_id"))
             if account_id_str in self.running_workers:
@@ -329,25 +279,27 @@ class Orchestrator:
                     logger.warning(f"⚠️ Account {account_id_str} đã có worker đang chạy")
                     return
             
-            # Invalidate cache khi spawn worker (vì account và profile đã được sử dụng)
+            logger.info(
+                f"🎯 Phát hiện task: account={pending_account.get('email')} "
+                f"(ID: {pending_account.get('_id')})"
+            )
+            
+            # Invalidate cache khi spawn worker (vì account đã được sử dụng)
             self._last_pending_result = None
             self._last_pending_query = 0  # Force refresh ở lần query tiếp theo
-            self._last_idle_profile_result = None
-            self._last_idle_profile_query = 0  # Force refresh ở lần query tiếp theo
             
-            # Spawn worker Create Gmail
-            await self._spawn_worker(pending_account, idle_profile)
+            # Spawn worker Create Gmail (sẽ tạo profile mới trong worker)
+            await self._spawn_worker(pending_account)
             
         except Exception as e:
             logger.error(f"❌ Lỗi trong scheduler loop: {e}", exc_info=True)
     
-    async def _spawn_worker(self, account: Dict[str, Any], profile: Dict[str, Any]):
+    async def _spawn_worker(self, account: Dict[str, Any]):
         """
         Spawn worker để tạo Gmail
         
         Args:
             account: Dict chứa thông tin account
-            profile: Dict chứa thông tin profile
         """
         try:
             from bson import ObjectId
@@ -358,15 +310,7 @@ class Orchestrator:
             # Cập nhật status account → "creating"
             self.db_manager.update_status(
                 account_id=account_id,
-                new_status="creating",
-                profile_id=profile.get("profile_id")
-            )
-            
-            # Cập nhật status profile → "in_use"
-            self.db_manager.update_profile_status(
-                profile_id=profile.get("profile_id"),
-                new_status="in_use",
-                account_id=account_id
+                new_status="creating"
             )
             
             # Submit worker task vào ThreadPoolExecutor
@@ -375,7 +319,6 @@ class Orchestrator:
             future = self.executor.submit(
                 create_gmail_account,
                 account,
-                profile,
                 self.db_manager,
                 self.gpm_manager,
                 self.proxy_manager,
@@ -387,7 +330,7 @@ class Orchestrator:
             self.running_workers[account_id_str] = future
             
             # Monitor worker khi hoàn thành
-            asyncio.create_task(self._monitor_worker(future, account_id_str, account, profile))
+            asyncio.create_task(self._monitor_worker(future, account_id_str, account))
             
         except Exception as e:
             logger.error(f"❌ Lỗi spawn worker: {e}", exc_info=True)
@@ -398,10 +341,6 @@ class Orchestrator:
                     account_id=ObjectId(account["_id"]),
                     new_status="pending"
                 )
-                self.db_manager.update_profile_status(
-                    profile_id=profile.get("profile_id"),
-                    new_status="idle"
-                )
             except Exception as rollback_error:
                 logger.error(f"❌ Lỗi rollback: {rollback_error}")
     
@@ -409,8 +348,7 @@ class Orchestrator:
         self,
         future,
         account_id_str: str,
-        account: Dict[str, Any],
-        profile: Dict[str, Any]
+        account: Dict[str, Any]
     ):
         """
         Monitor worker và cleanup khi hoàn thành
@@ -419,7 +357,6 @@ class Orchestrator:
             future: Future từ ProcessPoolExecutor
             account_id_str: String ID của account
             account: Dict chứa thông tin account
-            profile: Dict chứa thông tin profile
         """
         try:
             # Đợi worker hoàn thành (với khả năng cancel khi shutdown)
@@ -465,7 +402,7 @@ class Orchestrator:
             if account_id_str in self.running_workers:
                 del self.running_workers[account_id_str]
             
-            # Profile sẽ được giải phóng trong worker khi stop_profile
+            # Profile sẽ được giải phóng trong worker khi stop_profile (profile được tạo mới trong worker)
             
         except asyncio.CancelledError:
             logger.info(f"⚠️ Monitor worker đã bị cancel cho account: {account.get('email')}")
@@ -480,14 +417,7 @@ class Orchestrator:
             if account_id_str in self.running_workers:
                 del self.running_workers[account_id_str]
             
-            # Rollback profile status
-            try:
-                self.db_manager.update_profile_status(
-                    profile_id=profile.get("profile_id"),
-                    new_status="idle"
-                )
-            except Exception as cleanup_error:
-                logger.error(f"❌ Lỗi cleanup profile: {cleanup_error}")
+            # Profile được tạo mới trong worker, không cần rollback
     
     def stop(self):
         """Dừng orchestrator"""

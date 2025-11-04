@@ -85,29 +85,43 @@ Quy tắc thao tác:
 
 2. Orchestrator chọn:
    - 01 account với `status="pending"`
-   - 01 profile với `status="idle"`
 
-3. Gọi API GPM → start profile → nhận `debugPort` → lưu `profile_id` vào document account & profile status → "in_use"
+3. Khi có proxy thành công:
+   - Gọi API ZingProxy `get-proxy?key={key}` để lấy thông tin proxy
+   - API response trả về `socks5Proxy` hoặc `httpProxy` trong format: "103.139.44.48:5555:xefzoorz:xeFZOOrZ" (theo tài liệu API)
+   - **Ưu tiên lấy nguyên vẹn chuỗi `socks5Proxy`** từ API response (không parse)
+   - **Nếu không có `socks5Proxy` → fallback sang `httpProxy`**
+   - Nếu không có cả hai → FAIL-FAST
+   - Gọi API GPM → **TẠO MỚI profile** với proxy (POST /api/v3/profiles/create)
+   - Profile được tạo với thông số proxy: chỉ thêm prefix tương ứng vào đầu chuỗi
+     • Nếu dùng `socks5Proxy`: `socks5Proxy` = "103.139.44.48:5555:xefzoorz:xeFZOOrZ" → `raw_proxy` = "socks5://103.139.44.48:5555:xefzoorz:xeFZOOrZ"
+     • Nếu dùng `httpProxy`: `httpProxy` = "103.139.44.48:5677:xefzoorz:xeFZOOrZ" → `raw_proxy` = "http://103.139.44.48:5677:xefzoorz:xeFZOOrZ"
+   - Nhận về `profile_id` mới từ API response
+   - Lưu `profile_id` vào document account
 
-4. Selenium attach debugger → điền form Gmail Signup theo dữ liệu account
+4. Gọi API GPM → start profile mới tạo → nhận `remote_debugging_port` → lưu profile status → "in_use"
 
-5. Nếu yêu cầu OTP:
+5. Selenium attach debugger → điền form Gmail Signup theo dữ liệu account
+   - **Last Name**: Nếu `last_name` là "x" (không phân biệt hoa thường) → **BỎ TRỐNG** (không điền)
+   - Nếu `last_name` có giá trị khác → điền giá trị đó
+
+6. Nếu yêu cầu OTP:
    - Retry tối đa 3 lần (khoảng delay ngẫu nhiên 2–6s giữa attempts)
    - Nếu vẫn thất bại → set `status="failed-phone"` → STOP profile
 
-6. Khi Gmail yêu cầu Recovery Email:
+7. Khi Gmail yêu cầu Recovery Email:
    - Worker set `status="waiting-recovery"` → notify operator (nếu cần) yêu cầu ấn **Done** trên GmailFarmerBot
    - TeleMonitor sẽ parse message Recovery (chứa recovery email)
    - Hệ thống map Recovery theo quy tắc trong MESSAGE ID block (ở trên)
    - Nếu map thành công → `status="recovery-received"` → Worker resume
    - Nếu không map được → `status="waiting-observe"` → giữ profile mở để operator can thiệp
 
-7. Nếu phát hiện Captcha / QR hoặc trang review bắt buộc tương tác:
+8. Nếu phát hiện Captcha / QR hoặc trang review bắt buộc tương tác:
    - Chụp screenshot
    - `status="failed-captcha"` (hoặc "failed" nếu không rõ)
    - Stop profile ngay — **KHÔNG** retry (FAIL-FAST)
 
-8. XỬ LÝ SAU KHI SIGNUP (gộp các bước liên quan)
+9. XỬ LÝ SAU KHI SIGNUP (gộp các bước liên quan)
    - Sau khi Worker submit form, kiểm tra phản hồi Bot:
      • Nếu Bot gửi: “⚠️ It seems you haven't added recovery email <recovery_email>”:
          → Worker quay lại Selenium → add `recovery_email` vào account → verify done → tiếp tục.
@@ -122,16 +136,23 @@ Quy tắc thao tác:
            - Nếu callback lỗi → set `status="waiting-observe"` + notify operator
        • Nếu nhấn Complete thành công → `status="created"` → Stop profile → giải phóng tài nguyên
 
-9. Stop profile → Giải phóng tài nguyên
+10. Stop profile → Giải phóng tài nguyên
+   - Sau khi stop profile, có thể xóa profile khỏi GPM (mode=2) hoặc giữ lại (tùy chọn)
 
 ========================================================
 III. QUY TẮC BẮT BUỘC (HARD RULES)
 ========================================================
 - KHÔNG dùng GPM No-Code Automation để điền form Gmail.
 - Chỉ dùng GPM cho fingerprint + remote-debugger attach.
-- Mỗi profile = 01 account (không reuse profile cho nhiều account đồng thời).
+- Mỗi profile = 01 account (tạo mới profile cho mỗi account, không reuse).
 - Không warm-up Gmail sau khi tạo.
 - Proxy VN bắt buộc cho mỗi profile (ZingProxy API).
+- **Ưu tiên sử dụng `socks5Proxy`** từ ZingProxy API response, **fallback sang `httpProxy`** nếu không có.
+- Lấy **nguyên vẹn chuỗi** từ API (ví dụ: "103.139.44.48:5555:xefzoorz:xeFZOOrZ").
+- Format proxy khi tạo profile GPM: chỉ thêm prefix tương ứng vào đầu chuỗi
+  - Nếu dùng `socks5Proxy`: `socks5://103.139.44.48:5555:xefzoorz:xeFZOOrZ`
+  - Nếu dùng `httpProxy`: `http://103.139.44.48:5677:xefzoorz:xeFZOOrZ`
+- Nếu API không trả về cả `socks5Proxy` và `httpProxy` → FAIL-FAST
 - Logs + Screenshots bắt buộc cho mọi lỗi.
 
 ========================================================
@@ -150,10 +171,19 @@ Lỗi cụ thể:
 - Captcha/QR detect → failed-captcha → DỪNG NGAY
 - Không tìm thấy DOM → retry ≤3 → nếu vẫn lỗi → failed
 - DebugPort không trả về → failed-start
+- **Lỗi proxy (ERR_NO_SUPPORTED_PROXIES, etc.) → failed-proxy → KILL PROFILE ngay → KHÔNG retry**
 - Chrome crash/debugger mất kết nối → error
 - Exception bất kỳ → error
 
 TẤT CẢ LỖI → FAIL FAST để bảo vệ fingerprint & proxy
+
+**QUY TẮC ĐẶC BIỆT CHO LỖI PROXY:**
+- Khi phát hiện lỗi proxy (ERR_NO_SUPPORTED_PROXIES, ERR_PROXY_CONNECTION_FAILED, etc.):
+  1. Set status = "failed-proxy"
+  2. Screenshot
+  3. **KILL profile** (xóa vĩnh viễn khỏi GPM) → không mở lại
+  4. Orchestrator KHÔNG chọn account này nữa (loại trừ failed-proxy)
+  5. Dừng trình duyệt ngay, không retry
 
 ========================================================
 V. TRẠNG THÁI DB (BẮT BUỘC)
@@ -167,6 +197,8 @@ V. TRẠNG THÁI DB (BẮT BUỘC)
 - created
 - failed-phone
 - failed-captcha
+- failed-start
+- failed-proxy (Lỗi proxy nghiêm trọng - profile đã bị kill, KHÔNG retry)
 - failed
 - error
 

@@ -40,6 +40,11 @@ SCHEDULER_CHECK_INTERVAL = int(os.getenv("SCHEDULER_CHECK_INTERVAL", "10"))  # s
 GPM_API_URL = os.getenv("GPM_API_URL", "http://127.0.0.1:19995")
 GPM_API_KEY = os.getenv("GPM_API_KEY", "")  # Để trống nếu dùng local GPM
 
+# GPM ChromeDriver Path - Đường dẫn đến ChromeDriver của GPM
+# Ví dụ: C:\Users\HAI\AppData\Local\Programs\GPMLogin\gpm_browser\gpm_browser_chromium_core_139\gpmdriver.exe
+# Nếu không có, sẽ dùng webdriver-manager để tự động download
+GPM_CHROMEDRIVER_PATH = os.getenv("GPM_CHROMEDRIVER_PATH", "")
+
 # ZingProxy API Configuration
 ZINGPROXY_API_URL = os.getenv("ZINGPROXY_API_URL", "https://api.zingproxy.com")
 ZINGPROXY_API_KEY = os.getenv("ZINGPROXY_API_KEY", "")  # Deprecated: giữ để tương thích
